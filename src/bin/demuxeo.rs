@@ -1,3 +1,5 @@
+use std::process;
+
 use clap::Parser;
 use futures::TryStreamExt;
 use muxeo::{Frame, FrameKind, MAX};
@@ -21,8 +23,35 @@ impl Decoder for EoDecoder {
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if src.len() < 1 + 4 {
-            // Not enough data to read kind and length marker.
+            // Not enough data to read kind marker and length marker / exit
+            // status code.
             return Ok(None);
+        }
+
+        // Read kind marker.
+        let kind = match src[0] {
+            0 => FrameKind::Err,
+            1 => FrameKind::ExitStatusCode,
+            2 => FrameKind::Out,
+            k => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid frame kind {}.", k),
+                ));
+            }
+        };
+
+        if let FrameKind::ExitStatusCode = kind {
+            // Read exit status code.
+            let mut code_bytes = [0; 4];
+            code_bytes.copy_from_slice(&src[1..1 + 4]);
+            let code = i32::from_be_bytes(code_bytes);
+
+            // Use advance to modify src such that it no longer contains this
+            // frame.
+            src.advance(1 + 4);
+
+            return Ok(Some(Frame::ExitStatusCode(code)));
         }
 
         // Read length marker.
@@ -51,18 +80,6 @@ impl Decoder for EoDecoder {
             return Ok(None);
         }
 
-        // Read kind marker.
-        let kind = match src[0] {
-            0 => FrameKind::Err,
-            1 => FrameKind::Out,
-            k => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Invalid frame kind {}.", k),
-                ));
-            }
-        };
-
         // Use advance and split_to to modify src such that it no longer
         // contains this frame.
         src.advance(1 + 4);
@@ -71,6 +88,7 @@ impl Decoder for EoDecoder {
         Ok(Some(match kind {
             FrameKind::Err => Frame::Err(bytes),
             FrameKind::Out => Frame::Out(bytes),
+            _ => unreachable!(),
         }))
     }
 }
@@ -88,6 +106,7 @@ async fn main() -> io::Result<()> {
             Frame::Err(mut bytes) => {
                 stderr.write_all_buf(&mut bytes).await?;
             }
+            Frame::ExitStatusCode(code) => process::exit(code),
             Frame::Out(mut bytes) => {
                 stdout.write_all_buf(&mut bytes).await?;
             }

@@ -1,7 +1,4 @@
-use std::{
-    ffi::OsString,
-    process::{self, Stdio},
-};
+use std::{ffi::OsString, process::Stdio};
 
 use clap::Parser;
 use futures::{SinkExt, TryStreamExt};
@@ -28,9 +25,21 @@ impl Encoder<Frame> for EoEncoder {
     type Error = io::Error;
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        if let Frame::ExitStatusCode(code) = item {
+            // Reserve space in the buffer.
+            dst.reserve(1 + 4);
+
+            // Write the kind and exit status code to the buffer.
+            dst.put_u8(FrameKind::ExitStatusCode as u8);
+            dst.put_i32(code);
+
+            return Ok(());
+        }
+
         let (kind, bytes) = match item {
             Frame::Err(bytes) => (FrameKind::Err, bytes),
             Frame::Out(bytes) => (FrameKind::Out, bytes),
+            _ => unreachable!(),
         };
 
         let bytes_len = bytes.len();
@@ -69,15 +78,14 @@ async fn main() -> io::Result<()> {
 
     let stderr = ReaderStream::with_capacity(child.stderr.take().unwrap(), MAX).map_ok(Frame::Err);
     let stdout = ReaderStream::with_capacity(child.stdout.take().unwrap(), MAX).map_ok(Frame::Out);
+    let mut writer = FramedWrite::new(io::stdout(), EoEncoder);
 
-    FramedWrite::new(io::stdout(), EoEncoder)
-        .send_all(&mut stderr.merge(stdout))
-        .await?;
+    writer.send_all(&mut stderr.merge(stdout)).await?;
 
     let status = child.wait().await?;
 
     if let Some(code) = status.code() {
-        process::exit(code);
+        writer.send(Frame::ExitStatusCode(code)).await?;
     }
 
     Ok(())
